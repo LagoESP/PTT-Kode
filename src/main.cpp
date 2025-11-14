@@ -1,698 +1,618 @@
 /*
- * Base Project for Kode Dot (ESP32-S3)
+ * Kode Dot PTT (Push-to-Talk) App
  * ------------------------------------------------------------
- * Purpose
- *  - Provide a clean, production-ready starting point that wires up
- *    all the on-board peripherals with clear, English documentation.
- *  - Keep implementations in this file for approachability; advanced
- *    board abstractions live under `lib/kodedot_bsp/`.
+ * Propósito:
+ * - Implementa la lógica de 'client.py' en el hardware de Kode Dot.
+ * - Utiliza el 'Base Project' como plantilla para la inicialización
+ * del hardware (Display, LVGL, LED, Expansor de E/S).
  *
- * Features covered
- *  - Display + LVGL v9 UI
- *  - Touch + IO Expander buttons
- *  - Addressable LED (WS2812B) with robust RMT init
- *  - SD card over SD_MMC (1-bit)
- *  - IMU (LSM6DSOX) + Magnetometer (LIS2MDL)
- *  - RTC (MAX31329)
- *  - PMIC / Charger (BQ25896)
- *  - Fuel Gauge (BQ27220)
- *
- * Guidance
- *  - All sections are documented with why/what they do and how to change
- *    common parameters.
- *  - Prefer short, frequent updates (1–60s) and avoid long blocking calls.
- *  - Serial prints are informative but minimal; adjust verbosity as needed.
+ * Funcionalidad:
+ * - Se conecta a WiFi y se autentica en el servidor para obtener un token.
+ * - Se conecta al servidor WebSocket para PTT.
+ * - Usa el BOTÓN A como un botón físico de "Hold-to-Talk" (PTT).
+ * - Captura audio 16kHz/16-bit del mic I2S mientras PTT está presionado.
+ * - Envía audio como mensajes binarios de WebSocket.
+ * - Recibe audio binario de WebSocket y lo reproduce en el altavoz I2S.
+ * - Muestra el estado (Conectando, Listo, Hablando, Entrante) en la pantalla LVGL.
+ * - Usa el LED RGB para indicar el estado (Verde=Hablando, Naranja=Entrante).
  */
+
+// =================================================================
+// --- Includes del Template de Kode Dot ---
+// =================================================================
 #include <Arduino.h>
 #include <lvgl.h>
 #include <kodedot/display_manager.h>
 #include <TCA9555.h>
 #include <kodedot/pin_config.h>
 #include <Adafruit_NeoPixel.h>
-// SD card (SD_MMC, 1-bit)
-#include <FS.h>
-#include <SD_MMC.h>
-// IMU + Magnetometer
-#include <Wire.h>
-#include <Adafruit_LIS2MDL.h>
-#include <Adafruit_LSM6DSOX.h>
-#include <esp_pm.h>
-// RTC MAX31329
-#include <kode_MAX31329.h>
-// PMIC BQ25896
-#include <PMIC_BQ25896.h>
-// Fuel gauge BQ27220
-#include <BQ27220.h>
-// Brand logo image (generated C array)
-extern const lv_image_dsc_t logotipo;
 
-// ---- Brand fonts (Inter) ----
-// These symbols are provided by the generated font C files under src/fonts/
-extern const lv_font_t Inter_20;
-extern const lv_font_t Inter_30;
-extern const lv_font_t Inter_40;
-extern const lv_font_t Inter_50;
+// Fonts are compiled as separate C translation units in src/fonts/
+extern "C" {
+    extern const lv_font_t Inter_20;
+    extern const lv_font_t Inter_30;
+    extern const lv_font_t Inter_40;
+}
+
+// =================================================================
+// --- Includes AÑADIDOS para PTT ---
+// =================================================================
+#include <WiFi.h>
+#include <ArduinoHttpClient.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include "driver/i2s.h"
+
+// =================================================================
+// --- Includes de Fuentes (desde tu proyecto) ---
+// =================================================================
+// NOTE: Font .c files live in src/fonts/ and are compiled separately by
+// the build system. Do NOT #include the .c files here (causes duplicate
+// symbol / redefinition errors). Refer to the font objects (e.g. Inter_20)
+// directly in code; they will be linked from the separate compilation units.
+
+// =================================================================
+// --- TUS_SECRETOS_AQUI ---
+// =================================================================
+// --- Wi-Fi ---
+const char *WIFI_SSID = "Lago Sommer IoT";
+const char *WIFI_PASS = "Jose1999";
+
+// --- Credenciales del Servidor ---
+// (Las mismas que usas en el cliente Python)
+// IMPORTANTE: Actualiza estos valores con las credenciales de tu servidor
+const char *USERNAME = "kode_dot";      // Cambiar a tu usuario
+const char *PASSWORD = "kode_dot_pass"; // Cambiar a tu contraseña
+
+// =================================================================
+// --- Configuración del Servidor y Cliente ---
+// (Extraído de tu client.py)
+// =================================================================
+const char *SERVER_HOST = "192.168.178.4";
+const int SERVER_PORT = 8000;
+const unsigned long KEEPALIVE_MS = 20000;     // 20s ws keepalive ping
+const unsigned long AUDIO_DECAY_MS = 1200;    // cómo se mantiene visible "incoming"
+
+// =================================================================
+// --- Configuración de Audio (de client.py) ---
+// =================================================================
+const int SAMPLE_RATE = 16000;
+const int BITS_PER_SAMPLE = 16;
+// 512 bytes por chunk / 2 bytes por muestra = 256 muestras
+const int AUDIO_BUFFER_SAMPLES = 256;
+// Tamaño del buffer en bytes
+const int I2S_READ_BUFFER_BYTES = AUDIO_BUFFER_SAMPLES * (BITS_PER_SAMPLE / 8);
+// Buffer para leer del micrófono
+int16_t i2s_read_buffer[AUDIO_BUFFER_SAMPLES];
+
+// =================================================================
+// --- Variables Globales de Estado ---
+// =================================================================
+// --- Red ---
+WiFiClient wifiClient;
+HttpClient httpClient(wifiClient, SERVER_HOST, SERVER_PORT);
+WebSocketsClient webSocket;
+String globalToken;    // Token de autenticación
+String globalDeviceId; // ID de este dispositivo
+bool isWebSocketConnected = false;
+unsigned long lastPingTime = 0;
+
+// --- Estado PTT ---
+// 'volatile' es crucial porque estas variables son modificadas
+// por tareas (Tasks) y leídas por otras.
+volatile bool isPttActive = false;
+volatile bool pttStateChanged = false; // Flag para notificar al loop principal
+
+// --- Estado Audio Entrante ---
+volatile unsigned long lastAudioReceiveTime = 0;
+volatile bool isReceivingAudio = false;
+
+// --- Hardware Kode Dot ---
+// Create TCA9555 with address from BSP config
+TCA9555 io_expander(IOEXP_I2C_ADDR);
+// NeoPixel (use BSP defines)
+Adafruit_NeoPixel led_strip(NEO_PIXEL_COUNT, NEO_PIXEL_PIN, LED_STRIP_COLOR_ORDER + LED_STRIP_TIMING);
 
 // Display manager instance
-DisplayManager display;
+DisplayManager displayManager;
 
-// UI labels
-static lv_obj_t *touch_label;
-static lv_obj_t *button_label;
-static lv_obj_t *sd_label;
-static lv_obj_t *imu_label;
-static lv_obj_t *mag_label;
-static lv_obj_t *rtc_label;
-static lv_obj_t *pmic_label;
-static lv_obj_t *gauge_label;
+// --- UI (LVGL) ---
+lv_obj_t *lblStatus;
+lv_obj_t *lblPttStatus;
+lv_obj_t *lblIncomingStatus;
 
-// IO Expander
-static TCA9555 ioexp(IOEXP_I2C_ADDR);
-
-// NeoPixel
-static Adafruit_NeoPixel pixel(NEO_PIXEL_COUNT, NEO_PIXEL_PIN, LED_STRIP_COLOR_ORDER + LED_STRIP_TIMING);
-static esp_pm_lock_handle_t g_no_light_sleep_lock = nullptr;
-
-// -----------------------------------------------------------------------------
-// Update cadences (ms) – tweak to balance responsiveness vs. CPU usage
-// -----------------------------------------------------------------------------
-static const uint32_t GUI_LOOP_DELAY_MS   = 5;      // loop() delay – target ~200 Hz
-static const uint32_t IMU_UPDATE_MS       = 1000;   // IMU + MAG
-static const uint32_t RTC_UPDATE_MS       = 1000;   // RTC (1 s)
-static const uint32_t PMIC_UPDATE_MS      = 1000;   // Charger/PMIC status
-static const uint32_t GAUGE_UPDATE_MS     = 1000;   // Fuel gauge
-
-// -----------------------------------------------------------------------------
-// Brand palette (see design guide)
-// -----------------------------------------------------------------------------
-static const lv_color_t KODE_BG_DARK        = lv_color_hex(0x000000); // background (brand: black)
-static const lv_color_t KODE_TEXT_LIGHT     = lv_color_hex(0xFFFAF5); // normal light text
-static const lv_color_t KODE_TEXT_MUTED     = lv_color_hex(0x9A948F); // titles / not highlighted
-static const lv_color_t KODE_ACCENT         = lv_color_hex(0xFF7F1F); // accent
-static const lv_color_t KODE_ACCENT_SECOND  = lv_color_hex(0x7B00FF); // secondary accent
-
-// Global styles
-static lv_style_t style_screen_bg;
-static lv_style_t style_title;
-static lv_style_t style_text;
-static lv_style_t style_hint;
-static lv_style_t style_accent;
-
-static void setupBrandStyles() {
-    lv_style_init(&style_screen_bg);
-    lv_style_set_bg_color(&style_screen_bg, KODE_BG_DARK);
-
-    lv_style_init(&style_title);
-    lv_style_set_text_color(&style_title, KODE_TEXT_LIGHT);
-    lv_style_set_text_font(&style_title, &Inter_50);
-
-    lv_style_init(&style_text);
-    lv_style_set_text_color(&style_text, KODE_TEXT_LIGHT);
-    lv_style_set_text_font(&style_text, &Inter_20);
-
-    lv_style_init(&style_hint);
-    lv_style_set_text_color(&style_hint, KODE_TEXT_LIGHT);
-    lv_style_set_text_font(&style_hint, &Inter_20);
-
-    lv_style_init(&style_accent);
-    lv_style_set_text_color(&style_accent, KODE_ACCENT);
-    lv_style_set_text_font(&style_accent, &Inter_20);
+// =================================================================
+// --- Helpers de LED (del template main.cpp) ---
+// =================================================================
+void led_setup()
+{
+    led_strip.begin();
+    led_strip.setBrightness(20); // Brillo (0-255)
+    led_strip.clear();
+    led_strip.show();
 }
 
-// -----------------------------------------------------------------------------
-// Forward declarations
-// -----------------------------------------------------------------------------
-void createUserInterface();
-void createFontExamples(lv_obj_t *parent);
-void updateTouchDisplay();
-void updateButtonDisplay();
-void initSdCardDemo();
-static const char* sdTypeToText(uint8_t t);
-void initImuAndMag();
-void updateImuAndMag();
-void initRtc();
-void updateRtc();
-void initPmic();
-void updatePmic();
-void initGauge();
-void updateGauge();
+void led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    led_strip.setPixelColor(0, led_strip.Color(r, g, b));
+}
 
-void setup() {
-    // ---- Boot diagnostics ----
-    Serial.begin(115200);
-    Serial.println("Starting Base Project with LVGL...");
+void led_show()
+{
+    led_strip.show();
+}
 
-    // Initialize display subsystem
-    if (!display.init()) {
-        Serial.println("Error: Failed to initialize display");
-        while(1) {
+// =================================================================
+// --- Funciones de Configuración PTT ---
+// =================================================================
+
+void setupI2S()
+{
+    Serial.println("Configurando I2S...");
+
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // Mono (o LEFT, depende del mic)
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 64,
+        .use_apll = false,
+        .tx_desc_auto_clear = true
+    };
+
+    // Usar los pines definidos en kodedot/pin_config.h
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = MIC_I2S_SCK,
+        .ws_io_num = MIC_I2S_WS,
+        // Speaker pin not defined in BSP; leave as -1 if unused
+        .data_out_num = -1, // Altavoz (no definido en BSP)
+        .data_in_num = MIC_I2S_DIN     // Micrófono
+    };
+
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+
+    Serial.println("I2S configurado.");
+}
+
+void setupWifi()
+{
+    lv_label_set_text(lblStatus, "Connecting to WiFi...");
+    Serial.print("Conectando a ");
+    Serial.println(WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi conectado.");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+}
+
+bool tryRegisterUser()
+{
+    Serial.println("[REGISTER] Intentando registrar nuevo usuario...");
+    lv_label_set_text(lblStatus, "Registering...");
+
+    String friendlyName = String(USERNAME) + "_device";
+    
+    // Prepare JSON: {"username": "...", "password": "...", "friendlyName": "..."}
+    JsonDocument doc;
+    doc["username"] = USERNAME;
+    doc["password"] = PASSWORD;
+    doc["friendlyName"] = friendlyName;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    
+    Serial.println("Enviando registro...");
+    Serial.println(jsonStr);
+    
+    httpClient.post("/register", "application/json", jsonStr);
+    int statusCode = httpClient.responseStatusCode();
+    String responseBody = httpClient.responseBody();
+
+    Serial.printf("[REGISTER] Status: %d\n", statusCode);
+    Serial.println(responseBody);
+
+    if (statusCode == 200 || statusCode == 201)
+    {
+        Serial.println("[REGISTER] ¡Registro exitoso!");
+        return true;
+    }
+    return false;
+}
+
+bool loginAndGetDevice()
+{
+    lv_label_set_text(lblStatus, "Authenticating...");
+    Serial.println("1. Autenticando (obteniendo token)...");
+
+    String contentType = "application/x-www-form-urlencoded";
+    String postData = "username=" + String(USERNAME) + "&password=" + String(PASSWORD);
+
+    httpClient.post("/token", contentType, postData);
+    int statusCode = httpClient.responseStatusCode();
+    String responseBody = httpClient.responseBody();
+
+    // Si obtiene 401, intenta registrar un nuevo usuario
+    if (statusCode == 401)
+    {
+        Serial.println("[AUTH] 401 Unauthorized. Intentando auto-registro...");
+        lv_label_set_text(lblStatus, "Registering...");
+        delay(1000);
+
+        if (tryRegisterUser())
+        {
+            // Ahora intenta login de nuevo
+            Serial.println("[AUTH] Registro exitoso. Reintentando login...");
             delay(1000);
+            
+            httpClient.post("/token", contentType, postData);
+            statusCode = httpClient.responseStatusCode();
+            responseBody = httpClient.responseBody();
+            
+            if (statusCode != 200)
+            {
+                Serial.printf("[AUTH] Login después de registro falló, status: %d\n", statusCode);
+                Serial.println(responseBody);
+                lv_label_set_text(lblStatus, "Auth failed after reg");
+                return false;
+            }
+        }
+        else
+        {
+            Serial.println("[AUTH] Registro falló. Verifica el servidor.");
+            lv_label_set_text(lblStatus, "Register failed");
+            return false;
         }
     }
-
-    // Create the UI
-    setupBrandStyles();
-    createUserInterface();
-    // Try to mount SD and show status
-    initSdCardDemo();
-    // Initialize IMU + Magnetometer
-    initImuAndMag();
-    // Initialize RTC
-    initRtc();
-    // Initialize PMIC/Charger
-    initPmic();
-    // Initialize Fuel Gauge
-    initGauge();
-    
-    // Initialize IO Expander (inputs)
-    if (!ioexp.begin(INPUT)) {
-        Serial.println("Warning: IO Expander not connected");
+    else if (statusCode != 200)
+    {
+        Serial.printf("[AUTH] Error al obtener token, status: %d\n", statusCode);
+        Serial.println(responseBody);
+        lv_label_set_text(lblStatus, "Auth failed");
+        return false;
     }
 
-  // Configure TOP button (use internal pull-up for reliable reads)
-  pinMode(BUTTON_TOP, INPUT_PULLUP);
+    JsonDocument doc;
+    deserializeJson(doc, responseBody);
+    globalToken = doc["access_token"].as<String>();
+    Serial.println("[AUTH] Token obtenido.");
+    Serial.printf("[AUTH] Token: %s\n", globalToken.c_str());
 
-    // Initialize NeoPixel
-  // Keep ESP32-S3 out of light sleep while initializing RMT for NeoPixel.
-  // RMT init can fail during light sleep transitions on S3 if not locked.
-  if (!g_no_light_sleep_lock) {
-      if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "neopixel", &g_no_light_sleep_lock) == ESP_OK) {
-          esp_pm_lock_acquire(g_no_light_sleep_lock);
-      }
-  }
-  pinMode(NEO_PIXEL_PIN, OUTPUT);
-  pixel.begin();
-  // Global brightness (~20%)
-  pixel.setBrightness(51);
-  pixel.clear();
-  pixel.show();
+    // 2. Obtener Device ID
+    lv_label_set_text(lblStatus, "Getting Device ID...");
+    Serial.println("2. Obteniendo Device ID...");
+    httpClient.beginRequest();
+    httpClient.get("/devices/me");
+    httpClient.sendHeader("Authorization", "Bearer " + globalToken);
+    httpClient.endRequest();
 
-  // Start LED off (idle)
-  pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-  pixel.show();
+    statusCode = httpClient.responseStatusCode();
+    responseBody = httpClient.responseBody();
 
-    Serial.println("System ready!");
+    if (statusCode != 200)
+    {
+        Serial.printf("[AUTH] Error al obtener device ID, status: %d\n", statusCode);
+        Serial.println(responseBody);
+        lv_label_set_text(lblStatus, "Auth failed (Device)");
+        return false;
+    }
+
+    deserializeJson(doc, responseBody);
+    globalDeviceId = doc["deviceId"].as<String>();
+    Serial.print("[AUTH] Device ID obtenido: ");
+    Serial.println(globalDeviceId);
+    return true;
 }
 
-void loop() {
-    // Pump display subsystem (LVGL timers + rendering)
-    display.update();
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
+{
+    size_t bytes_written = 0;
+    switch (type)
+    {
+    case WStype_DISCONNECTED: {
+        Serial.println("[WS] Desconectado.");
+        isWebSocketConnected = false;
+        if (lblStatus) lv_label_set_text(lblStatus, "Reconnecting...");
+        break;
+    }
+
+    case WStype_CONNECTED: {
+        Serial.println("[WS] Conectado.");
+        isWebSocketConnected = true;
+        if (lblStatus) lv_label_set_text(lblStatus, "Ready");
+        break;
+    }
+
+    case WStype_TEXT: {
+        // El client.py usa esto para "talk_start" / "talk_stop"
+        // (Ignorado por ahora, usamos WStype_BIN para el indicador 'incoming')
+        Serial.printf("[WS] Texto recibido: %s\n", payload);
+        break;
+    }
+
+    case WStype_BIN: {
+        // ¡Audio entrante!
+        lastAudioReceiveTime = millis();
+        isReceivingAudio = true;
+
+        // Escribir los datos de audio directamente al altavoz I2S
+        i2s_write(I2S_NUM_0, payload, length, &bytes_written, portMAX_DELAY);
+        if (bytes_written != length) {
+            Serial.println("[I2S] Error al escribir en altavoz");
+        }
+        break;
+    }
+
+    default: {
+        break;
+    }
+    }
+}
+
+void setupWebSocket()
+{
+    lv_label_set_text(lblStatus, "Connecting to WS...");
+    Serial.println("3. Conectando a WebSocket...");
+    String ws_path = "/ws/" + globalDeviceId + "?token=" + globalToken;
+    webSocket.begin(SERVER_HOST, SERVER_PORT, ws_path);
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(5000);
+}
+
+// =================================================================
+// --- UI (LVGL) ---
+// =================================================================
+void create_ptt_ui()
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr); // Limpiar cualquier UI de ejemplo
+
+    // --- Estilo de Fuente ---
+    static lv_style_t style_status;
+    lv_style_init(&style_status);
+    lv_style_set_text_font(&style_status, &Inter_20);
+
+    static lv_style_t style_ptt;
+    lv_style_init(&style_ptt);
+    lv_style_set_text_font(&style_ptt, &Inter_40);
     
-    // Update touch coordinates on the UI
-    updateTouchDisplay();
-    updateButtonDisplay();
-    updateImuAndMag();
-    updateRtc();
-    updatePmic();
-    updateGauge();
+    static lv_style_t style_incoming;
+    lv_style_init(&style_incoming);
+    lv_style_set_text_font(&style_incoming, &Inter_30);
+    lv_style_set_text_color(&style_incoming, lv_palette_main(LV_PALETTE_ORANGE));
+
+    // --- Etiqueta de Estado (Superior) ---
+    lblStatus = lv_label_create(scr);
+    lv_obj_add_style(lblStatus, &style_status, 0);
+    lv_label_set_text(lblStatus, "Initializing...");
+    lv_obj_align(lblStatus, LV_ALIGN_TOP_MID, 0, 10);
+
+    // --- Etiqueta de Estado PTT (Centro) ---
+    lblPttStatus = lv_label_create(scr);
+    lv_obj_add_style(lblPttStatus, &style_ptt, 0);
+    lv_label_set_text(lblPttStatus, "HOLD TO TALK");
+    lv_obj_align(lblPttStatus, LV_ALIGN_CENTER, 0, 0);
+
+    // --- Etiqueta de Estado Entrante (Inferior) ---
+    lblIncomingStatus = lv_label_create(scr);
+    lv_obj_add_style(lblIncomingStatus, &style_incoming, 0);
+    lv_label_set_text(lblIncomingStatus, ""); // Vacío al inicio
+    lv_obj_align(lblIncomingStatus, LV_ALIGN_BOTTOM_MID, 0, -30);
+}
+
+// =================================================================
+// --- Tareas de FreeRTOS (Núcleo de la Lógica) ---
+// =================================================================
+
+/**
+ * Tarea (Core 0): Lee el botón PTT (BTN_A) desde el expansor de E/S.
+ * Establece el flag 'isPttActive' y notifica al loop principal.
+ */
+void ptt_button_task(void *pvParameters)
+{
+    Serial.println("Iniciando PTT Button Task (Core 0)...");
     
-    delay(GUI_LOOP_DELAY_MS);
+    // El 'Wire' y el 'io_expander' se inicializan en setup()
+    bool lastState = false;
+
+    while (true)
+    {
+        // El botón bottom del expansor es active-low
+        bool currentState = !io_expander.read1(EXPANDER_BUTTON_BOTTOM);
+
+        if (currentState != lastState)
+        {
+            isPttActive = currentState;
+            pttStateChanged = true; // Notificar al loop principal para que actúe
+            lastState = currentState;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20)); // Poll cada 20ms
+    }
 }
 
 /**
- * @brief Create the main user interface
- *
- * Minimal UI showing live status for SD, IMU/MAG, RTC, PMIC/Charger.
- * Extend this to add your own screens, themes, and widgets. For complex
- * apps, consider splitting screens into dedicated modules.
+ * Tarea (Core 0): Lee continuamente desde el micrófono I2S.
+ * Si 'isPttActive' es true, envía los datos por WebSocket.
  */
-void createUserInterface() {
-    lv_obj_t * scr = lv_scr_act();
-    // Apply brand background style and center content using flex layout
-    lv_obj_add_style(scr, &style_screen_bg, 0);
-    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(scr, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    // Compact padding/row spacing to ensure everything fits vertically
-    lv_obj_set_style_pad_all(scr, 6, 0);
-    lv_obj_set_style_pad_row(scr, 4, 0);
-    // Top padding = 0; we'll space the logo from top using its own margin (20px)
-    lv_obj_set_style_pad_top(scr, 0, 0);
+void i2s_read_task(void *pvParameters)
+{
+    Serial.println("Iniciando I2S Read Task (Core 0)...");
+    size_t bytes_read = 0;
 
-    // Logo at the very top, tinted with brand light color (no textual title)
-    lv_obj_t * img_logo = lv_image_create(scr);
-    lv_image_set_src(img_logo, &logotipo);
-    lv_obj_set_style_img_recolor_opa(img_logo, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_bg_opa(img_logo, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_margin_top(img_logo, 40, 0);
+    while (true)
+    {
+        // Leer datos del micrófono I2S
+        esp_err_t err = i2s_read(I2S_NUM_0, (void *)i2s_read_buffer, I2S_READ_BUFFER_BYTES, &bytes_read, portMAX_DELAY);
 
-    // Content container: fills remaining space and centers its children
-    lv_obj_t * content = lv_obj_create(scr);
-    lv_obj_set_size(content, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_grow(content, 1);
-    lv_obj_set_style_pad_all(content, 6, 0);
-    lv_obj_set_style_pad_row(content, 6, 0);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        if (err != ESP_OK) {
+            Serial.printf("[I2S Read Task] Error de lectura: %d\n", err);
+            continue;
+        }
 
-    // Label for touch coordinates
-    touch_label = lv_label_create(content);
-    lv_obj_add_style(touch_label, &style_text, 0);
-    lv_label_set_text(touch_label, "Touch: (-, -)");
-    lv_obj_set_style_text_font(touch_label, &Inter_20, 0);
-
-    // Label for buttons state (expander)
-    button_label = lv_label_create(content);
-    lv_obj_add_style(button_label, &style_text, 0);
-    lv_label_set_text(button_label, "Button: none");
-    lv_obj_set_style_text_font(button_label, &Inter_20, 0);
-
-    // Ejemplos de diferentes fuentes
-    // Omit font examples in base UI to save space
-
-    // Label for SD status
-    sd_label = lv_label_create(content);
-    lv_obj_add_style(sd_label, &style_text, 0);
-    lv_label_set_text(sd_label, "SD: --");
-    lv_obj_set_style_text_font(sd_label, &Inter_20, 0);
-
-    // Label for IMU + MAG
-    imu_label = lv_label_create(content);
-    lv_obj_add_style(imu_label, &style_text, 0);
-    lv_label_set_text(imu_label, "IMU: --");
-    lv_obj_set_style_text_font(imu_label, &Inter_20, 0);
-
-    mag_label = lv_label_create(content);
-    lv_obj_add_style(mag_label, &style_text, 0);
-    lv_label_set_text(mag_label, "MAG: --");
-    lv_obj_set_style_text_font(mag_label, &Inter_20, 0);
-
-    // Label for RTC time
-    rtc_label = lv_label_create(content);
-    lv_obj_add_style(rtc_label, &style_text, 0);
-    lv_label_set_text(rtc_label, "RTC: --");
-    lv_obj_set_style_text_font(rtc_label, &Inter_20, 0);
-
-    // Label for PMIC status
-    pmic_label = lv_label_create(content);
-    lv_obj_add_style(pmic_label, &style_text, 0);
-    lv_label_set_text(pmic_label, "PMIC: --");
-    lv_obj_set_style_text_font(pmic_label, &Inter_20, 0);
-
-    // Optional hint
-    lv_obj_t * hint = lv_label_create(content);
-    lv_obj_add_style(hint, &style_hint, 0);
-    lv_label_set_text(hint, "Hold TOP button to test LED colors");
-
-    // Label for Fuel Gauge
-    gauge_label = lv_label_create(content);
-    lv_obj_set_style_text_font(gauge_label, &lv_font_montserrat_18, 0);
-    lv_label_set_text(gauge_label, "BAT: --");
-    lv_obj_set_style_text_color(gauge_label, KODE_TEXT_LIGHT, 0);
+        // Enviar solo si PTT está activo y conectado
+        if (isPttActive && isWebSocketConnected && bytes_read > 0)
+        {
+            webSocket.sendBIN((uint8_t *)i2s_read_buffer, bytes_read);
+        }
+    }
 }
 
-/**
- * @brief Create sample labels using different font sizes
- */
-void createFontExamples(lv_obj_t *parent) {
-    // Small font
-    lv_obj_t * font_small = lv_label_create(parent);
-    lv_obj_set_style_text_font(font_small, &lv_font_montserrat_14, 0);
-    lv_label_set_text(font_small, "Montserrat 14px");
-    lv_obj_set_style_text_color(font_small, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(font_small, LV_ALIGN_BOTTOM_LEFT, 20, -80);
+// =================================================================
+// --- Setup y Loop (Funciones Principales) ---
+// =================================================================
 
-    // Medium font
-    lv_obj_t * font_medium = lv_label_create(parent);
-    lv_obj_set_style_text_font(font_medium, &lv_font_montserrat_18, 0);
-    lv_label_set_text(font_medium, "Montserrat 18px");
-    lv_obj_set_style_text_color(font_medium, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(font_medium, LV_ALIGN_BOTTOM_LEFT, 20, -50);
+void setup()
+{
+    Serial.begin(115200);
+    Serial.println("--- Iniciando Kode Dot PTT Client ---");
+
+    // --- Inicialización de Hardware (del template) ---
+    // Iniciar I2C para el expansor de E/S (usar pines del BSP)
+    Wire.begin(IOEXP_I2C_SDA, IOEXP_I2C_SCL);
+
+    // Configurar Expansor de E/S
+    if (!io_expander.begin())
+    {
+        Serial.println("Error: No se pudo encontrar el expansor de E/S TCA9555.");
+        while (1) delay(100);
+    }
+    // Configurar BTN (bottom) como entrada en el expansor
+    io_expander.pinMode1(EXPANDER_BUTTON_BOTTOM, INPUT);
+
+    // Iniciar LED
+    led_setup();
+    led_set_rgb(0, 0, 20); // Azul durante el inicio
+    led_show();
+
+    // Iniciar Display y LVGL mediante DisplayManager
+    if (!displayManager.init()) {
+        Serial.println("Error: Display init failed");
+        while (1) delay(100);
+    }
+    create_ptt_ui(); // Crear nuestra UI personalizada
+    // --- Fin de Inicialización de Hardware ---
+
+
+    // --- Inicialización PTT ---
+    setupI2S();
+    setupWifi();
+
+    if (loginAndGetDevice())
+    {
+        setupWebSocket();
+    }
+    else
+    {
+        Serial.println("Error en la autenticación. deteniendo.");
+        lv_label_set_text(lblStatus, "Auth Failed!");
+        while (1) delay(100);
+    }
     
-    // Large font
-    lv_obj_t * font_large = lv_label_create(parent);
-    lv_obj_set_style_text_font(font_large, &lv_font_montserrat_42, 0);
-    lv_label_set_text(font_large, "42");
-    lv_obj_set_style_text_color(font_large, lv_color_hex(0x999999), 0);
-    lv_obj_align(font_large, LV_ALIGN_BOTTOM_RIGHT, -30, -30);
-}
+    led_set_rgb(0, 0, 0); // Apagar LED
+    led_show();
 
-/**
- * @brief Update the touch coordinates label
- */
-void updateTouchDisplay() {
-    if (!touch_label) return;
+    // --- Iniciar Tareas (en Core 0) ---
+    xTaskCreatePinnedToCore(
+        ptt_button_task,   // Función de la Tarea
+        "PTTButtonTask",   // Nombre
+        2048,              // Stack size
+        NULL,              // Parámetros
+        5,                 // Prioridad
+        NULL,              // Handle
+        0                  // Core 0
+    );
+
+    xTaskCreatePinnedToCore(
+        i2s_read_task,     // Función de la Tarea
+        "I2SReadTask",     // Nombre
+        4096,              // Stack size
+        NULL,              // Parámetros
+        5,                 // Prioridad
+        NULL,              // Handle
+        0                  // Core 0
+    );
     
-    int16_t x, y;
-    if (display.getTouchCoordinates(x, y)) {
-        lv_label_set_text_fmt(touch_label, "Touch: (%d, %d)", x, y);
-    }
+    Serial.println("--- Configuración Completa ---");
 }
 
-static inline bool isPressed(uint8_t pinIndex) {
-    // Entradas con pull-up externa: activo en LOW
-    int v = ioexp.read1(pinIndex);
-    return (v != TCA9555_INVALID_READ) && (v == LOW);
-}
+void loop()
+{
+    // --- Tareas del Loop Principal (Core 1) ---
 
-static inline bool isGpioPressed(int gpio) {
-  return digitalRead(gpio) == LOW; // activo en LOW por pull-up externa
-}
+    // 1. Manejar el cliente WebSocket (muy importante)
+    webSocket.loop();
 
-void updateButtonDisplay() {
-    if (!button_label) return;
+    // 2. Manejar LVGL mediante DisplayManager (actualiza ticks y handlers)
+    displayManager.update();
+    delay(5);
 
-    const char* status = "none";
-
-  if (isGpioPressed(BUTTON_TOP)) {
-      status = "BUTTON_TOP";
-  } else if (isPressed(EXPANDER_BUTTON_BOTTOM)) {
-        status = "BUTTON_BOTTOM";
-    } else if (isPressed(EXPANDER_PAD_TOP)) {
-        status = "PAD_TOP";
-    } else if (isPressed(EXPANDER_PAD_BOTTOM)) {
-        status = "PAD_BOTTOM";
-    } else if (isPressed(EXPANDER_PAD_LEFT)) {
-        status = "PAD_LEFT";
-    } else if (isPressed(EXPANDER_PAD_RIGHT)) {
-        status = "PAD_RIGHT";
-    }
-
-    // Always update label and LED color based on current state
-    lv_label_set_text_fmt(button_label, "Button: %s", status);
-
-    // Hold-to-test: if TOP is held > 700ms, cycle RGB quickly to verify LED
-    static bool topWasPressed = false;
-    static uint32_t topPressStart = 0;
-    static uint8_t testPhase = 0;
-
-    bool topNow = (strcmp(status, "BUTTON_TOP") == 0);
-    uint32_t now = millis();
-    if (topNow && !topWasPressed) {
-        topWasPressed = true;
-        topPressStart = now;
-        testPhase = 0;
-    } else if (!topNow && topWasPressed) {
-        topWasPressed = false;
-    }
-
-    if (topWasPressed && (now - topPressStart > 700)) {
-        // non-blocking cycle every 150ms
-        static uint32_t lastStep = 0;
-        if (now - lastStep > 150) {
-            lastStep = now;
-            testPhase = (testPhase + 1) % 3;
-            uint32_t c = (testPhase == 0) ? pixel.Color(255,0,0)
-                         : (testPhase == 1) ? pixel.Color(0,255,0)
-                                            : pixel.Color(0,0,255);
-            pixel.setPixelColor(0, c);
-            pixel.show();
+    // 3. Manejar cambios de estado de PTT (desde el flag)
+    if (pttStateChanged)
+    {
+        pttStateChanged = false; // Resetear el flag
+        if (isPttActive)
+        {
+            // --- PTT PRESIONADO ---
+            Serial.println("PTT: START");
+            if (isWebSocketConnected) {
+                // Enviar "talk_start" (como en client.py)
+                webSocket.sendTXT("{\"type\":\"talk_start\"}");
+            }
+            lv_label_set_text(lblPttStatus, "TALKING");
+            led_set_rgb(0, 50, 0); // Verde
         }
-        return;
-    }
-
-    // Normal mapping: only TOP lights the LED; all others keep it off
-    uint32_t color = pixel.Color(0, 0, 0); // idle off
-    if (strcmp(status, "BUTTON_TOP") == 0) {
-        color = pixel.Color(255, 0, 0);      // red
-    }
-    pixel.setPixelColor(0, color);
-    pixel.show();
-}
-
-// Boot LED test removed per request
-
-static const char* sdTypeToText(uint8_t t) {
-    switch (t) {
-        case CARD_MMC: return "MMC";
-        case CARD_SD: return "SDSC";
-        case CARD_SDHC: return "SDHC";
-        default: return "UNKNOWN";
-    }
-}
-
-void initSdCardDemo() {
-    Serial.println("Mounting SD_MMC (1-bit)...");
-
-    // Assign custom pins from pin_config.h
-    if (!SD_MMC.setPins(SD_PIN_CLK, SD_PIN_CMD, SD_PIN_D0)) {
-        Serial.println("[SD] setPins failed");
-        if (sd_label) {
-            lv_label_set_text(sd_label, "SD: setPins failed");
-            lv_obj_set_style_text_color(sd_label, KODE_TEXT_LIGHT, 0);
+        else
+        {
+            // --- PTT SOLTADO ---
+            Serial.println("PTT: STOP");
+             if (isWebSocketConnected) {
+                // Enviar "talk_stop" (como en client.py)
+                webSocket.sendTXT("{\"type\":\"talk_stop\"}");
+            }
+            lv_label_set_text(lblPttStatus, "HOLD TO TALK");
+            led_set_rgb(0, 0, 0); // Apagado
         }
-        return;
+        led_show();
     }
 
-    // busWidth = 1 for 1-bit mode
-    if (!SD_MMC.begin(SD_MOUNT_POINT, 1)) {
-        Serial.println("[SD] Card mount failed");
-        if (sd_label) {
-            lv_label_set_text(sd_label, "SD: mount failed");
-            lv_obj_set_style_text_color(sd_label, KODE_TEXT_LIGHT, 0);
+    // 4. Manejar estado de audio entrante (LED y UI)
+    if (isReceivingAudio)
+    {
+        // Si estamos recibiendo, actualizar el estado
+        if (!isPttActive) // No mostrar "incoming" si estamos hablando
+        { 
+            lv_label_set_text(lblIncomingStatus, "INCOMING");
+            led_set_rgb(60, 30, 0); // Naranja
+            led_show();
         }
-        return;
+        isReceivingAudio = false; // Resetear (se activará en el próximo paquete)
     }
-
-    uint8_t type = SD_MMC.cardType();
-    if (type == CARD_NONE) {
-        Serial.println("[SD] No card attached");
-        if (sd_label) {
-            lv_label_set_text(sd_label, "SD: no card");
-            lv_obj_set_style_text_color(sd_label, KODE_TEXT_LIGHT, 0);
-        }
-        return;
-    }
-
-    uint64_t sizeMB = SD_MMC.cardSize() / (1024ULL * 1024ULL);
-    Serial.printf("[SD] Type=%s Size=%lluMB\n", sdTypeToText(type), sizeMB);
-
-    if (sd_label) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "SD: OK (%s %lluMB)", sdTypeToText(type), sizeMB);
-        lv_label_set_text(sd_label, buf);
-        lv_obj_set_style_text_color(sd_label, KODE_TEXT_LIGHT, 0);
-    }
-
-    // Minimal demo: list root directory
-    Serial.println("[SD] Listing root /");
-    File root = SD_MMC.open("/");
-    if (root && root.isDirectory()) {
-        File f = root.openNextFile();
-        while (f) {
-            Serial.printf("  %s %s (%u)\n", f.isDirectory() ? "DIR " : "FILE", f.name(), (unsigned)f.size());
-            f = root.openNextFile();
-        }
-    }
-}
-
-// ---- IMU + Magnetometer ----
-// Reads basic motion + magnetic field for demos and quick health checks.
-// Pins are configured in pin_config.h; wire is initialized once and reused.
-static Adafruit_LSM6DSOX imu;
-static Adafruit_LIS2MDL mag(12345);
-static MAX31329 rtc;
-static PMIC_BQ25896 bq;
-static BQ27220 gauge;
-
-void initImuAndMag() {
-    // Inicializa bus I2C con pines de la placa
-    Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL);
-
-    Serial.println("Init IMU (LSM6DSOX) + MAG (LIS2MDL)...");
-
-    bool imu_ok = imu.begin_I2C();
-    if (!imu_ok) {
-        Serial.println("[IMU] LSM6DSOX not found");
-        if (imu_label) {
-            lv_label_set_text(imu_label, "IMU: not found");
-            lv_obj_set_style_text_color(imu_label, KODE_TEXT_LIGHT, 0);
-        }
-    } else {
-        Serial.println("[IMU] LSM6DSOX OK");
-        if (imu_label) {
-            lv_label_set_text(imu_label, "IMU: OK");
-            lv_obj_set_style_text_color(imu_label, KODE_TEXT_LIGHT, 0);
+    else if (millis() - lastAudioReceiveTime > AUDIO_DECAY_MS)
+    {
+        // Si ha pasado tiempo desde el último paquete, limpiar
+        if (strlen(lv_label_get_text(lblIncomingStatus)) > 0)
+        {
+            lv_label_set_text(lblIncomingStatus, "");
+            if (!isPttActive) {
+                led_set_rgb(0, 0, 0); // Apagar
+                led_show();
+            }
         }
     }
 
-    bool mag_ok = mag.begin();
-    if (!mag_ok) {
-        Serial.println("[MAG] LIS2MDL not found");
-        if (mag_label) {
-            lv_label_set_text(mag_label, "MAG: not found");
-            lv_obj_set_style_text_color(mag_label, KODE_TEXT_LIGHT, 0);
-        }
-    } else {
-        Serial.println("[MAG] LIS2MDL OK");
-        if (mag_label) {
-            lv_label_set_text(mag_label, "MAG: OK");
-            lv_obj_set_style_text_color(mag_label, KODE_TEXT_LIGHT, 0);
-        }
-    }
-}
-
-// ---- RTC MAX31329 ----
-static void rtcPrintToSerialAndUi() {
-    if (!rtc.readTime()) {
-        Serial.println("[RTC] readTime failed");
-        if (rtc_label) {
-            lv_label_set_text(rtc_label, "RTC: read fail");
-            lv_obj_set_style_text_color(rtc_label, KODE_TEXT_LIGHT, 0);
-        }
-        return;
-    }
-    char buf[48];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
-             rtc.t.year, rtc.t.month, rtc.t.day,
-             rtc.t.hour, rtc.t.minute, rtc.t.second);
-    Serial.printf("[RTC] %s\n", buf);
-    if (rtc_label) {
-        lv_label_set_text_fmt(rtc_label, "RTC: %s", buf);
-        lv_obj_set_style_text_color(rtc_label, KODE_TEXT_LIGHT, 0);
-    }
-}
-
-// ---- PMIC BQ25896 ----
-// Shows power source (USB/Battery) and charge state (PRE/CARGA/COMPLETA).
-// Note: To source 5V on the upper connector, enable OTG (boost) mode using
-// setOTG_CONFIG(true). Keep disabled by default.
-static void pmicUpdateUi(bool haveUsb, uint8_t chrg_stat) {
-    if (!pmic_label) return;
-    const char* fuente = haveUsb ? "USB" : "BATERIA";
-    const char* estado = "IDLE";
-    switch (chrg_stat) {
-        case 1: estado = "PRE"; break;           // Pre-charge
-        case 2: estado = "CARGA"; break;         // Fast charge (CC/CV)
-        case 3: estado = "COMPLETA"; break;      // Done
-        default: estado = "IDLE"; break;         // Not charging
-    }
-    lv_label_set_text_fmt(pmic_label, "Fuente: %s  Estado: %s",
-                          fuente, estado);
-    lv_obj_set_style_text_color(pmic_label, KODE_TEXT_LIGHT, 0);
-}
-
-void initPmic() {
-    // Reutiliza Wire(48/47)
-    bq.begin();
-    delay(200);
-    // Habilita conversión continua de ADC (1 Hz) para refrescar medidas
-    bq.setCONV_RATE(true);
-
-    // Primera lectura para UI
-    auto vstat = bq.get_VBUS_STAT_reg();
-    bool haveUsb = vstat.pg_stat;                    // Power Good on VBUS
-    pmicUpdateUi(haveUsb, vstat.chrg_stat);
-
-    // To source 5V on the upper connector, enable boost mode:
-    // bq.setOTG_CONFIG(true);        // enable OTG/boost (5V out)
-    // bq.setPFM_OTG_DIS(false);      // optional: allow/disallow PFM in OTG
-}
-
-void updatePmic() {
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < PMIC_UPDATE_MS) return;
-    last = now;
-    // En modo continuo no es necesario; si se desactiva, usar setCONV_START(true)
-    auto vstat = bq.get_VBUS_STAT_reg();
-    bool haveUsb = vstat.pg_stat;
-    pmicUpdateUi(haveUsb, vstat.chrg_stat);
-}
-
-// ---- Fuel Gauge BQ27220 ----
-void initGauge() {
-    if (!gauge.begin(Wire, 0x55, -1, -1, 400000)) {
-        Serial.println("[GAUGE] BQ27220 not found");
-        if (gauge_label) {
-            lv_label_set_text(gauge_label, "BAT: gauge not found");
-            lv_obj_set_style_text_color(gauge_label, KODE_TEXT_LIGHT, 0);
-        }
-        return;
-    }
-    Serial.println("[GAUGE] BQ27220 OK");
-}
-
-void updateGauge() {
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < 1000) return; // 1 s
-    last = now;
-    int soc = gauge.readStateOfChargePercent();
-    int ma  = gauge.readCurrentMilliamps(); // positive = charging
-    if (gauge_label) {
-        lv_label_set_text_fmt(gauge_label, "BAT: %d%%  I=%dmA", soc, ma);
-        lv_obj_set_style_text_color(gauge_label, KODE_TEXT_LIGHT, 0);
-    }
-}
-
-void initRtc() {
-    // Reutiliza Wire ya en pines 48/47
-    rtc.begin();
-    // Si necesitas fijar hora inicial, descomenta y ajusta:
-    // rtc.t.year=2025; rtc.t.month=1; rtc.t.day=1; rtc.t.hour=0; rtc.t.minute=0; rtc.t.second=0; rtc.t.dayOfWeek=3;
-    // rtc.writeTime();
-    rtcPrintToSerialAndUi();
-}
-
-void updateRtc() {
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < RTC_UPDATE_MS) return;
-    last = now;
-    rtcPrintToSerialAndUi();
-}
-
-void updateImuAndMag() {
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < IMU_UPDATE_MS) return;
-    last = now;
-
-    // Read IMU
-    sensors_event_t accel, gyro, temp;
-    bool haveImu = imu.getEvent(&accel, &gyro, &temp);
-    static float yawDeg = 0.0f; // integrated yaw from gyro (deg)
-    static uint32_t lastYawMs = 0;
-
-    float rollRad = 0.0f, pitchRad = 0.0f;
-    if (haveImu) {
-        const float ax = accel.acceleration.x;
-        const float ay = accel.acceleration.y;
-        const float az = accel.acceleration.z;
-
-        // Roll and Pitch from accelerometer (in radians)
-        rollRad  = atan2f(ay, az);
-        pitchRad = atan2f(-ax, sqrtf(ay * ay + az * az));
-
-        const float rollDeg  = rollRad * RAD_TO_DEG;
-        const float pitchDeg = pitchRad * RAD_TO_DEG;
-
-        // Gyro in deg/s for serial debug
-        const float gx_dps = gyro.gyro.x * RAD_TO_DEG;
-        const float gy_dps = gyro.gyro.y * RAD_TO_DEG;
-        const float gz_dps = gyro.gyro.z * RAD_TO_DEG;
-
-        // Integrate yaw from gyro Z (deg)
-        if (lastYawMs == 0) lastYawMs = now;
-        float dtSec = (now - lastYawMs) / 1000.0f;
-        lastYawMs = now;
-        yawDeg += gz_dps * dtSec;
-        // Normalize to [0,360)
-        while (yawDeg < 0.0f) yawDeg += 360.0f;
-        while (yawDeg >= 360.0f) yawDeg -= 360.0f;
-
-        Serial.printf("IMU  : roll=%.1f pitch=%.1f yaw=%.1f  | gyro(dps)=(%.1f, %.1f, %.1f)  temp=%.1f C\n",
-                      rollDeg, pitchDeg, yawDeg, gx_dps, gy_dps, gz_dps, temp.temperature);
-        if (imu_label) {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "IMU roll=%.1f pitch=%.1f yaw=%.1f", rollDeg, pitchDeg, yawDeg);
-            lv_label_set_text(imu_label, buf);
-        }
-    }
-
-    // Read Magnetometer and show raw values
-    sensors_event_t mev;
-    if (mag.getEvent(&mev)) {
-        const float mx = mev.magnetic.x;
-        const float my = mev.magnetic.y;
-        const float mz = mev.magnetic.z;
-        Serial.printf("MAG  : raw(uT)=(%.1f, %.1f, %.1f)\n", mx, my, mz);
-        if (mag_label) {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "MAG x=%.1f y=%.1f z=%.1f uT", mx, my, mz);
-            lv_label_set_text(mag_label, buf);
-        }
+    // 5. Enviar Ping de Keepalive (como en client.py)
+    if (isWebSocketConnected && (millis() - lastPingTime > KEEPALIVE_MS))
+    {
+        webSocket.sendTXT("{\"type\":\"ping\"}");
+        lastPingTime = millis();
     }
 }
