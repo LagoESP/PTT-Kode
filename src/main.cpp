@@ -1,24 +1,24 @@
 /*
  * Kode Dot PTT (Push-to-Talk) App
  * ------------------------------------------------------------
- * Propósito:
- * - Implementa la lógica de 'client.py' en el hardware de Kode Dot.
- * - Utiliza el 'Base Project' como plantilla para la inicialización
- * del hardware (Display, LVGL, LED, Expansor de E/S).
+ * Purpose:
+ * - Implements the logic of 'client.py' on Kode Dot hardware.
+ * - Uses the 'Base Project' as a template for hardware initialization
+ * (Display, LVGL, LED, I/O Expander).
  *
- * Funcionalidad:
- * - Se conecta a WiFi y se autentica en el servidor para obtener un token.
- * - Se conecta al servidor WebSocket para PTT.
- * - Usa el BOTÓN A como un botón físico de "Hold-to-Talk" (PTT).
- * - Captura audio 16kHz/16-bit del mic I2S mientras PTT está presionado.
- * - Envía audio como mensajes binarios de WebSocket.
- * - Recibe audio binario de WebSocket y lo reproduce en el altavoz I2S.
- * - Muestra el estado (Conectando, Listo, Hablando, Entrante) en la pantalla LVGL.
- * - Usa el LED RGB para indicar el estado (Verde=Hablando, Naranja=Entrante).
+ * Functionality:
+ * - Connects to WiFi and authenticates with the server to obtain a token.
+ * - Connects to the WebSocket server for PTT.
+ * - Uses BUTTON A as a physical "Hold-to-Talk" (PTT) button.
+ * - Captures 16kHz/16-bit audio from I2S mic while PTT is pressed.
+ * - Sends audio as WebSocket binary messages.
+ * - Receives binary audio from WebSocket and plays it on I2S speaker.
+ * - Displays status (Connecting, Ready, Talking, Incoming) on LVGL screen.
+ * - Uses RGB LED to indicate status (Green=Talking, Orange=Incoming).
  */
 
 // =================================================================
-// --- Includes del Template de Kode Dot ---
+// --- Template Include Headers ---
 // =================================================================
 #include <Arduino.h>
 #include <lvgl.h>
@@ -35,16 +35,18 @@ extern "C" {
 }
 
 // =================================================================
-// --- Includes AÑADIDOS para PTT ---
+// --- Includes Added for PTT ---
 // =================================================================
 #include <WiFi.h>
 #include <ArduinoHttpClient.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include "driver/i2s.h"
+#include <SD_MMC.h>
+#include <FS.h>
 
 // =================================================================
-// --- Includes de Fuentes (desde tu proyecto) ---
+// --- Font References (from your project) ---
 // =================================================================
 // NOTE: Font .c files live in src/fonts/ and are compiled separately by
 // the build system. Do NOT #include the .c files here (causes duplicate
@@ -52,58 +54,61 @@ extern "C" {
 // directly in code; they will be linked from the separate compilation units.
 
 // =================================================================
-// --- TUS_SECRETOS_AQUI ---
+// --- Configuration Secrets ---
 // =================================================================
-// --- Wi-Fi ---
-const char *WIFI_SSID = "Lago Sommer IoT";
-const char *WIFI_PASS = "Jose1999";
+// --- WiFi (will be read from SD: Wi-Fi.json) ---
+String WIFI_SSID = "";
+String WIFI_PASS = "";
 
-// --- Credenciales del Servidor ---
-// (Las mismas que usas en el cliente Python)
-// IMPORTANTE: Actualiza estos valores con las credenciales de tu servidor
-const char *USERNAME = "kode_dot";      // Cambiar a tu usuario
-const char *PASSWORD = "kode_dot_pass"; // Cambiar a tu contraseña
+// --- Server Credentials ---
+// (Device MAC will be used as USERNAME and PASSWORD)
+String USERNAME = "";  // Will be filled with MAC
+String PASSWORD = "";  // Will be filled with MAC
+String FRIENDLY_NAME = "Kode_Dot_PTT"; // Will be read from General/PTT.json
 
 // =================================================================
-// --- Configuración del Servidor y Cliente ---
-// (Extraído de tu client.py)
+// --- Server and Client Configuration ---
+// (Extracted from client.py)
 // =================================================================
-const char *SERVER_HOST = "192.168.178.4";
-const int SERVER_PORT = 8000;
+// Default endpoint (can be overridden by /General/PTT.json)
+String SERVER_ENDPOINT = "http://192.168.178.4:8000";
+String server_host_str = "192.168.178.4";
+int server_port_int = 8000;
 const unsigned long KEEPALIVE_MS = 20000;     // 20s ws keepalive ping
-const unsigned long AUDIO_DECAY_MS = 1200;    // cómo se mantiene visible "incoming"
+const unsigned long AUDIO_DECAY_MS = 1200;    // how long to keep "incoming" visible
 
 // =================================================================
-// --- Configuración de Audio (de client.py) ---
+// --- Audio Configuration (from client.py) ---
 // =================================================================
 const int SAMPLE_RATE = 16000;
 const int BITS_PER_SAMPLE = 16;
-// 512 bytes por chunk / 2 bytes por muestra = 256 muestras
+// 512 bytes per chunk / 2 bytes per sample = 256 samples
 const int AUDIO_BUFFER_SAMPLES = 256;
-// Tamaño del buffer en bytes
+// Buffer size in bytes
 const int I2S_READ_BUFFER_BYTES = AUDIO_BUFFER_SAMPLES * (BITS_PER_SAMPLE / 8);
-// Buffer para leer del micrófono
+// Buffer to read from microphone
 int16_t i2s_read_buffer[AUDIO_BUFFER_SAMPLES];
 
 // =================================================================
-// --- Variables Globales de Estado ---
+// --- Global State Variables ---
 // =================================================================
-// --- Red ---
+// --- Network ---
 WiFiClient wifiClient;
-HttpClient httpClient(wifiClient, SERVER_HOST, SERVER_PORT);
+// httpClient will be initialized at runtime after reading PTT.json endpoint
+HttpClient *httpClient = nullptr;
 WebSocketsClient webSocket;
-String globalToken;    // Token de autenticación
-String globalDeviceId; // ID de este dispositivo
+String globalToken;    // Authentication token
+String globalDeviceId; // ID of this device
 bool isWebSocketConnected = false;
 unsigned long lastPingTime = 0;
 
-// --- Estado PTT ---
-// 'volatile' es crucial porque estas variables son modificadas
-// por tareas (Tasks) y leídas por otras.
+// --- PTT State ---
+// 'volatile' is critical because these variables are modified
+// by tasks and read by others.
 volatile bool isPttActive = false;
-volatile bool pttStateChanged = false; // Flag para notificar al loop principal
+volatile bool pttStateChanged = false; // Flag to notify main loop
 
-// --- Estado Audio Entrante ---
+// --- Incoming Audio State ---
 volatile unsigned long lastAudioReceiveTime = 0;
 volatile bool isReceivingAudio = false;
 
@@ -122,7 +127,7 @@ lv_obj_t *lblPttStatus;
 lv_obj_t *lblIncomingStatus;
 
 // =================================================================
-// --- Helpers de LED (del template main.cpp) ---
+// --- LED Helper Functions (from template main.cpp) ---
 // =================================================================
 void led_setup()
 {
@@ -143,18 +148,131 @@ void led_show()
 }
 
 // =================================================================
-// --- Funciones de Configuración PTT ---
+// --- SD Card and Configuration Functions ---
+// =================================================================
+
+String getDeviceMAC()
+{
+    Serial.println("Getting device MAC address...");
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    String result(macStr);
+    Serial.printf("MAC: %s\n", result.c_str());
+    return result;
+}
+
+bool readOrCreatePTTConfig()
+{
+    Serial.println("Reading PTT.json from General/...");
+    lv_label_set_text(lblStatus, "Reading PTT.json...");
+    displayManager.update();
+
+    // Create General folder if it doesn't exist
+    if (!SD_MMC.exists("/General"))
+    {
+        Serial.println("Creating General folder...");
+        SD_MMC.mkdir("/General");
+    }
+
+    // Read PTT.json if it exists
+    if (SD_MMC.exists("/General/PTT.json"))
+    {
+        File file = SD_MMC.open("/General/PTT.json", FILE_READ);
+        if (file)
+        {
+            String content = "";
+            while (file.available())
+            {
+                content += (char)file.read();
+            }
+            file.close();
+
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, content);
+            if (!error)
+            {
+                if (doc.containsKey("Friendly_Name"))
+                {
+                    FRIENDLY_NAME = doc["Friendly_Name"].as<String>();
+                    Serial.printf("Friendly Name read: %s\n", FRIENDLY_NAME.c_str());
+                }
+                if (doc.containsKey("Endpoint"))
+                {
+                    SERVER_ENDPOINT = doc["Endpoint"].as<String>();
+                    Serial.printf("Endpoint read: %s\n", SERVER_ENDPOINT.c_str());
+
+                    // Parse host and port from endpoint (simple parser)
+                    String s = SERVER_ENDPOINT;
+                    if (s.startsWith("http://")) s = s.substring(7);
+                    else if (s.startsWith("https://")) s = s.substring(8);
+                    int slash = s.indexOf('/');
+                    if (slash != -1) s = s.substring(0, slash);
+                    int colon = s.indexOf(':');
+                    if (colon != -1)
+                    {
+                        server_host_str = s.substring(0, colon);
+                        server_port_int = s.substring(colon + 1).toInt();
+                    }
+                    else
+                    {
+                        server_host_str = s;
+                        server_port_int = 80;
+                    }
+
+                    // Initialize httpClient if not yet created
+                    if (httpClient == nullptr)
+                    {
+                        httpClient = new HttpClient(wifiClient, server_host_str.c_str(), server_port_int);
+                        Serial.printf("HttpClient initialized: %s:%d\n", server_host_str.c_str(), server_port_int);
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    // If it doesn't exist or there's an error, create with default value
+    Serial.println("Creating PTT.json with default value...");
+    FRIENDLY_NAME = "Kode_Dot_PTT";
+    
+    JsonDocument doc;
+    doc["Friendly_Name"] = FRIENDLY_NAME;
+    doc["Endpoint"] = SERVER_ENDPOINT;
+    
+    File file = SD_MMC.open("/General/PTT.json", FILE_WRITE);
+    if (file)
+    {
+        serializeJson(doc, file);
+        file.close();
+        Serial.println("PTT.json created successfully");
+        Serial.printf("PTT.json default Endpoint: %s\n", SERVER_ENDPOINT.c_str());
+        return true;
+    }
+
+    Serial.println("ERROR: Could not create PTT.json");
+    return false;
+}
+
+// =================================================================
+// --- PTT Configuration Functions ---
 // =================================================================
 
 void setupI2S()
 {
-    Serial.println("Configurando I2S...");
+    Serial.println("Configuring I2S...");
+    lv_label_set_text(lblStatus, "I2S: Configuring...");
+    displayManager.update();
 
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // Mono (o LEFT, depende del mic)
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT, // Mono (depends on mic)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
@@ -163,153 +281,305 @@ void setupI2S()
         .tx_desc_auto_clear = true
     };
 
-    // Usar los pines definidos en kodedot/pin_config.h
+    // Use pins defined in kodedot/pin_config.h
     i2s_pin_config_t pin_config = {
         .bck_io_num = MIC_I2S_SCK,
         .ws_io_num = MIC_I2S_WS,
         // Speaker pin not defined in BSP; leave as -1 if unused
-        .data_out_num = -1, // Altavoz (no definido en BSP)
-        .data_in_num = MIC_I2S_DIN     // Micrófono
+        .data_out_num = -1, // Speaker (not defined in BSP)
+        .data_in_num = MIC_I2S_DIN     // Microphone
     };
 
+    lv_label_set_text(lblStatus, "I2S: Driver...");
+    displayManager.update();
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    
+    lv_label_set_text(lblStatus, "I2S: Pins...");
+    displayManager.update();
     i2s_set_pin(I2S_NUM_0, &pin_config);
+    
+    lv_label_set_text(lblStatus, "I2S: Clock...");
+    displayManager.update();
     i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    Serial.println("I2S configurado.");
+    Serial.println("I2S configured.");
+    lv_label_set_text(lblStatus, "I2S: OK");
+    displayManager.update();
+    delay(500);
 }
 
 void setupWifi()
 {
-    lv_label_set_text(lblStatus, "Connecting to WiFi...");
-    Serial.print("Conectando a ");
-    Serial.println(WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED)
+    lv_label_set_text(lblStatus, "WiFi: Reading networks...");
+    displayManager.update();
+    Serial.println("WiFi: Reading /Wi-Fi.json...");
+
+    // Check if file exists
+    if (!SD_MMC.exists("/Wi-Fi.json"))
     {
-        delay(500);
-        Serial.print(".");
+        Serial.println("ERROR: /Wi-Fi.json not found on SD card");
+        lv_label_set_text(lblStatus, "ERROR: No Wi-Fi.json");
+        displayManager.update();
+        return;
     }
-    Serial.println("\nWiFi conectado.");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+
+    // Read the JSON file
+    File file = SD_MMC.open("/Wi-Fi.json", FILE_READ);
+    if (!file)
+    {
+        Serial.println("ERROR: Cannot open /Wi-Fi.json");
+        lv_label_set_text(lblStatus, "ERROR: Cannot open WiFi.json");
+        displayManager.update();
+        return;
+    }
+
+    String content = "";
+    while (file.available())
+    {
+        content += (char)file.read();
+    }
+    file.close();
+
+    Serial.println("Raw JSON content:");
+    Serial.println(content);
+
+    // Parse JSON
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, content);
+
+    if (error)
+    {
+        Serial.print("JSON parse error: ");
+        Serial.println(error.c_str());
+        lv_label_set_text(lblStatus, "ERROR: JSON parse failed");
+        displayManager.update();
+        return;
+    }
+
+    if (!doc.is<JsonArray>())
+    {
+        Serial.println("ERROR: /Wi-Fi.json is not a JSON array");
+        lv_label_set_text(lblStatus, "ERROR: WiFi.json not array");
+        displayManager.update();
+        return;
+    }
+
+    // Get array and count networks
+    JsonArray networks = doc.as<JsonArray>();
+    int totalNets = networks.size();
+    
+    if (totalNets == 0)
+    {
+        Serial.println("ERROR: No networks in /Wi-Fi.json");
+        lv_label_set_text(lblStatus, "ERROR: No networks found");
+        displayManager.update();
+        return;
+    }
+
+    Serial.printf("Found %d WiFi networks\n", totalNets);
+
+    // Attempt to connect to each network
+    for (int i = 0; i < totalNets; i++)
+    {
+        JsonObject net = networks[i];
+        String ssid = net["ssid"].as<String>();
+        String pass = net["pass"].as<String>();
+
+        Serial.printf("[WiFi %d/%d] SSID: '%s', Pass: '%s'\n", i + 1, totalNets, ssid.c_str(), pass.c_str());
+
+        // Display progress: "Connecting... 1/X"
+        String status = "Connecting... " + String(i + 1) + "/" + String(totalNets);
+        lv_label_set_text(lblStatus, status.c_str());
+        displayManager.update();
+
+        Serial.printf("[WiFi %d/%d] Attempting: %s\n", i + 1, totalNets, ssid.c_str());
+
+        WiFi.begin(ssid.c_str(), pass.c_str());
+
+        // Wait up to 15 seconds per attempt
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 30)
+        {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            Serial.println("\n✓ WiFi connected!");
+            Serial.printf("SSID: %s\n", ssid.c_str());
+            Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+
+            // Display IP on screen
+            String ipStatus = "WiFi: " + WiFi.localIP().toString();
+            lv_label_set_text(lblStatus, ipStatus.c_str());
+            displayManager.update();
+            delay(1000);
+            return;
+        }
+
+        Serial.println();
+        Serial.printf("✗ Could not connect to: %s\n", ssid.c_str());
+    }
+
+    // If we get here, failed to connect to any network
+    Serial.println("ERROR: Could not connect to any WiFi network");
+    lv_label_set_text(lblStatus, "ERROR: WiFi not connected");
+    displayManager.update();
 }
 
 bool tryRegisterUser()
 {
-    Serial.println("[REGISTER] Intentando registrar nuevo usuario...");
-    lv_label_set_text(lblStatus, "Registering...");
+    Serial.println("[REGISTER] Attempting to register new user...");
+    lv_label_set_text(lblStatus, "Registering user...");
+    displayManager.update();
 
-    String friendlyName = String(USERNAME) + "_device";
-    
-    // Prepare JSON: {"username": "...", "password": "...", "friendlyName": "..."}
     JsonDocument doc;
     doc["username"] = USERNAME;
     doc["password"] = PASSWORD;
-    doc["friendlyName"] = friendlyName;
+    doc["friendlyName"] = FRIENDLY_NAME;
     
     String jsonStr;
     serializeJson(doc, jsonStr);
     
-    Serial.println("Enviando registro...");
+    Serial.println("Sending registration:");
     Serial.println(jsonStr);
+    displayManager.update();
     
-    httpClient.post("/register", "application/json", jsonStr);
-    int statusCode = httpClient.responseStatusCode();
-    String responseBody = httpClient.responseBody();
+    httpClient->post("/register", "application/json", jsonStr);
+    int statusCode = httpClient->responseStatusCode();
+    String responseBody = httpClient->responseBody();
 
     Serial.printf("[REGISTER] Status: %d\n", statusCode);
     Serial.println(responseBody);
 
     if (statusCode == 200 || statusCode == 201)
     {
-        Serial.println("[REGISTER] ¡Registro exitoso!");
+        Serial.println("[REGISTER] Registration successful!");
+        lv_label_set_text(lblStatus, "Registration successful!");
+        displayManager.update();
+        delay(1000);
         return true;
     }
+    
+    lv_label_set_text(lblStatus, "Registration failed");
+    displayManager.update();
+    delay(1000);
     return false;
 }
 
 bool loginAndGetDevice()
 {
-    lv_label_set_text(lblStatus, "Authenticating...");
-    Serial.println("1. Autenticando (obteniendo token)...");
+    lv_label_set_text(lblStatus, "Authentication in progress...");
+    displayManager.update();
+    Serial.println("1. Authenticating (getting token)...");
 
     String contentType = "application/x-www-form-urlencoded";
     String postData = "username=" + String(USERNAME) + "&password=" + String(PASSWORD);
 
-    httpClient.post("/token", contentType, postData);
-    int statusCode = httpClient.responseStatusCode();
-    String responseBody = httpClient.responseBody();
+    Serial.println("  Sending credentials...");
+    lv_label_set_text(lblStatus, "Sending credentials...");
+    displayManager.update();
+    
+    httpClient->post("/token", contentType, postData);
+    int statusCode = httpClient->responseStatusCode();
+    String responseBody = httpClient->responseBody();
 
-    // Si obtiene 401, intenta registrar un nuevo usuario
+    Serial.printf("  Status code: %d\n", statusCode);
+
+    // If 401, try to register a new user
     if (statusCode == 401)
     {
-        Serial.println("[AUTH] 401 Unauthorized. Intentando auto-registro...");
-        lv_label_set_text(lblStatus, "Registering...");
+        Serial.println("[AUTH] 401 Unauthorized. Attempting auto-registration...");
+        lv_label_set_text(lblStatus, "401: Registering...");
+        displayManager.update();
         delay(1000);
 
         if (tryRegisterUser())
         {
-            // Ahora intenta login de nuevo
-            Serial.println("[AUTH] Registro exitoso. Reintentando login...");
+            // Now try login again
+            Serial.println("[AUTH] Registration successful. Retrying login...");
+            lv_label_set_text(lblStatus, "Login again...");
+            displayManager.update();
             delay(1000);
             
-            httpClient.post("/token", contentType, postData);
-            statusCode = httpClient.responseStatusCode();
-            responseBody = httpClient.responseBody();
+            httpClient->post("/token", contentType, postData);
+            statusCode = httpClient->responseStatusCode();
+            responseBody = httpClient->responseBody();
+            
+            Serial.printf("  Status code (retry): %d\n", statusCode);
             
             if (statusCode != 200)
             {
-                Serial.printf("[AUTH] Login después de registro falló, status: %d\n", statusCode);
+                Serial.printf("[AUTH] Login after registration failed, status: %d\n", statusCode);
                 Serial.println(responseBody);
-                lv_label_set_text(lblStatus, "Auth failed after reg");
+                lv_label_set_text(lblStatus, "Error: Login failed");
+                displayManager.update();
                 return false;
             }
         }
         else
         {
-            Serial.println("[AUTH] Registro falló. Verifica el servidor.");
-            lv_label_set_text(lblStatus, "Register failed");
+            Serial.println("[AUTH] Registration failed. Check the server.");
+            lv_label_set_text(lblStatus, "Error: Registration failed");
+            displayManager.update();
             return false;
         }
     }
     else if (statusCode != 200)
     {
-        Serial.printf("[AUTH] Error al obtener token, status: %d\n", statusCode);
+        Serial.printf("[AUTH] Error obtaining token, status: %d\n", statusCode);
         Serial.println(responseBody);
-        lv_label_set_text(lblStatus, "Auth failed");
+        lv_label_set_text(lblStatus, ("Error " + String(statusCode)).c_str());
+        displayManager.update();
         return false;
     }
 
+    lv_label_set_text(lblStatus, "Token obtained!");
+    displayManager.update();
+    
     JsonDocument doc;
     deserializeJson(doc, responseBody);
     globalToken = doc["access_token"].as<String>();
-    Serial.println("[AUTH] Token obtenido.");
+    Serial.println("[AUTH] Token obtained.");
     Serial.printf("[AUTH] Token: %s\n", globalToken.c_str());
+    delay(500);
 
-    // 2. Obtener Device ID
+    // 2. Get Device ID
     lv_label_set_text(lblStatus, "Getting Device ID...");
-    Serial.println("2. Obteniendo Device ID...");
-    httpClient.beginRequest();
-    httpClient.get("/devices/me");
-    httpClient.sendHeader("Authorization", "Bearer " + globalToken);
-    httpClient.endRequest();
+    displayManager.update();
+    Serial.println("2. Getting Device ID...");
+    Serial.println("  Sending request...");
+    
+    httpClient->beginRequest();
+    httpClient->get("/devices/me");
+    httpClient->sendHeader("Authorization", "Bearer " + globalToken);
+    httpClient->endRequest();
 
-    statusCode = httpClient.responseStatusCode();
-    responseBody = httpClient.responseBody();
+    statusCode = httpClient->responseStatusCode();
+    responseBody = httpClient->responseBody();
+
+    Serial.printf("  Status code: %d\n", statusCode);
 
     if (statusCode != 200)
     {
-        Serial.printf("[AUTH] Error al obtener device ID, status: %d\n", statusCode);
+        Serial.printf("[AUTH] Error obtaining device ID, status: %d\n", statusCode);
         Serial.println(responseBody);
-        lv_label_set_text(lblStatus, "Auth failed (Device)");
+        lv_label_set_text(lblStatus, "Error: Device ID");
+        displayManager.update();
         return false;
     }
 
     deserializeJson(doc, responseBody);
     globalDeviceId = doc["deviceId"].as<String>();
-    Serial.print("[AUTH] Device ID obtenido: ");
+    Serial.print("[AUTH] Device ID obtained: ");
     Serial.println(globalDeviceId);
+    
+    lv_label_set_text(lblStatus, "Authenticated successfully!");
+    displayManager.update();
+    delay(1000);
+    
     return true;
 }
 
@@ -319,35 +589,35 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     switch (type)
     {
     case WStype_DISCONNECTED: {
-        Serial.println("[WS] Desconectado.");
+        Serial.println("[WS] Disconnected.");
         isWebSocketConnected = false;
         if (lblStatus) lv_label_set_text(lblStatus, "Reconnecting...");
         break;
     }
 
     case WStype_CONNECTED: {
-        Serial.println("[WS] Conectado.");
+        Serial.println("[WS] Connected.");
         isWebSocketConnected = true;
         if (lblStatus) lv_label_set_text(lblStatus, "Ready");
         break;
     }
 
     case WStype_TEXT: {
-        // El client.py usa esto para "talk_start" / "talk_stop"
-        // (Ignorado por ahora, usamos WStype_BIN para el indicador 'incoming')
-        Serial.printf("[WS] Texto recibido: %s\n", payload);
+        // client.py uses this for "talk_start" / "talk_stop"
+        // (Ignored for now, we use WStype_BIN for 'incoming' indicator)
+        Serial.printf("[WS] Text received: %s\n", payload);
         break;
     }
 
     case WStype_BIN: {
-        // ¡Audio entrante!
+        // Incoming audio!
         lastAudioReceiveTime = millis();
         isReceivingAudio = true;
 
-        // Escribir los datos de audio directamente al altavoz I2S
+        // Write audio data directly to I2S speaker
         i2s_write(I2S_NUM_0, payload, length, &bytes_written, portMAX_DELAY);
         if (bytes_written != length) {
-            Serial.println("[I2S] Error al escribir en altavoz");
+            Serial.println("[I2S] Error writing to speaker");
         }
         break;
     }
@@ -360,12 +630,24 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
 void setupWebSocket()
 {
-    lv_label_set_text(lblStatus, "Connecting to WS...");
-    Serial.println("3. Conectando a WebSocket...");
+    lv_label_set_text(lblStatus, "WebSocket: Connecting...");
+    displayManager.update();
+    Serial.println("3. Connecting to WebSocket...");
     String ws_path = "/ws/" + globalDeviceId + "?token=" + globalToken;
-    webSocket.begin(SERVER_HOST, SERVER_PORT, ws_path);
+    
+    Serial.println("  Path: " + ws_path);
+    lv_label_set_text(lblStatus, "WS: Starting...");
+    displayManager.update();
+    
+    // Use parsed host/port from SERVER_ENDPOINT (server_host_str, server_port_int)
+    webSocket.begin(server_host_str.c_str(), server_port_int, ws_path);
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(5000);
+    
+    lv_label_set_text(lblStatus, "WS: Waiting for connection...");
+    displayManager.update();
+    
+    Serial.println("  WebSocket configured");
 }
 
 // =================================================================
@@ -374,91 +656,100 @@ void setupWebSocket()
 void create_ptt_ui()
 {
     lv_obj_t *scr = lv_scr_act();
-    lv_obj_clean(scr); // Limpiar cualquier UI de ejemplo
+    lv_obj_clean(scr); // Clear any example UI
 
-    // --- Estilo de Fuente ---
+    // Set screen background to black
+    static lv_style_t style_screen;
+    lv_style_init(&style_screen);
+    lv_style_set_bg_color(&style_screen, lv_color_hex(0x000000));
+    lv_obj_add_style(scr, &style_screen, 0);
+
+    // --- Font Style ---
     static lv_style_t style_status;
     lv_style_init(&style_status);
     lv_style_set_text_font(&style_status, &Inter_20);
+    // Make general font color grey
+    lv_style_set_text_color(&style_status, lv_color_hex(0x808080));
 
     static lv_style_t style_ptt;
     lv_style_init(&style_ptt);
     lv_style_set_text_font(&style_ptt, &Inter_40);
+    lv_style_set_text_color(&style_ptt, lv_color_hex(0x808080));
     
     static lv_style_t style_incoming;
     lv_style_init(&style_incoming);
     lv_style_set_text_font(&style_incoming, &Inter_30);
     lv_style_set_text_color(&style_incoming, lv_palette_main(LV_PALETTE_ORANGE));
 
-    // --- Etiqueta de Estado (Superior) ---
+    // --- Status Label (Top) ---
     lblStatus = lv_label_create(scr);
     lv_obj_add_style(lblStatus, &style_status, 0);
     lv_label_set_text(lblStatus, "Initializing...");
     lv_obj_align(lblStatus, LV_ALIGN_TOP_MID, 0, 10);
 
-    // --- Etiqueta de Estado PTT (Centro) ---
+    // --- PTT Status Label (Center) ---
     lblPttStatus = lv_label_create(scr);
     lv_obj_add_style(lblPttStatus, &style_ptt, 0);
     lv_label_set_text(lblPttStatus, "HOLD TO TALK");
     lv_obj_align(lblPttStatus, LV_ALIGN_CENTER, 0, 0);
 
-    // --- Etiqueta de Estado Entrante (Inferior) ---
+    // --- Incoming Status Label (Bottom) ---
     lblIncomingStatus = lv_label_create(scr);
     lv_obj_add_style(lblIncomingStatus, &style_incoming, 0);
-    lv_label_set_text(lblIncomingStatus, ""); // Vacío al inicio
+    lv_label_set_text(lblIncomingStatus, ""); // Empty at start
     lv_obj_align(lblIncomingStatus, LV_ALIGN_BOTTOM_MID, 0, -30);
 }
 
 // =================================================================
-// --- Tareas de FreeRTOS (Núcleo de la Lógica) ---
+// --- FreeRTOS Tasks (Core Logic) ---
 // =================================================================
 
 /**
- * Tarea (Core 0): Lee el botón PTT (BTN_A) desde el expansor de E/S.
- * Establece el flag 'isPttActive' y notifica al loop principal.
+ * Task (Core 0): Reads the PTT button (BTN_A) from the I/O expander.
+ * Sets the 'isPttActive' flag and notifies the main loop.
  */
 void ptt_button_task(void *pvParameters)
 {
-    Serial.println("Iniciando PTT Button Task (Core 0)...");
+    Serial.println("Starting PTT Button Task (Core 0)...");
     
-    // El 'Wire' y el 'io_expander' se inicializan en setup()
+    // The 'Wire' and 'io_expander' are initialized in setup()
     bool lastState = false;
 
     while (true)
     {
-        // El botón bottom del expansor es active-low
+        // The bottom button of the expander is active-low
         bool currentState = !io_expander.read1(EXPANDER_BUTTON_BOTTOM);
 
         if (currentState != lastState)
         {
             isPttActive = currentState;
-            pttStateChanged = true; // Notificar al loop principal para que actúe
+            pttStateChanged = true; // Notify main loop to act
             lastState = currentState;
         }
-        vTaskDelay(pdMS_TO_TICKS(20)); // Poll cada 20ms
+        vTaskDelay(pdMS_TO_TICKS(20)); // Poll every 20ms
     }
 }
 
 /**
- * Tarea (Core 0): Lee continuamente desde el micrófono I2S.
- * Si 'isPttActive' es true, envía los datos por WebSocket.
+ * Task (Core 0): Continuously reads from the I2S microphone.
+ * If 'isPttActive' is true, sends the data via WebSocket.
  */
 void i2s_read_task(void *pvParameters)
 {
-    Serial.println("Iniciando I2S Read Task (Core 0)...");
+    Serial.println("Starting I2S Read Task (Core 0)...");
     size_t bytes_read = 0;
 
     while (true)
     {
-        // Leer datos del micrófono I2S
+        // Read data from I2S microphone
         esp_err_t err = i2s_read(I2S_NUM_0, (void *)i2s_read_buffer, I2S_READ_BUFFER_BYTES, &bytes_read, portMAX_DELAY);
 
         if (err != ESP_OK) {
-            Serial.printf("[I2S Read Task] Error de lectura: %d\n", err);
+            Serial.printf("[I2S Read Task] Read error: %d\n", err);
             continue;
         }
 
-        // Enviar solo si PTT está activo y conectado
+        // Send only if PTT is active and connected
         if (isPttActive && isWebSocketConnected && bytes_read > 0)
         {
             webSocket.sendBIN((uint8_t *)i2s_read_buffer, bytes_read);
@@ -467,149 +758,218 @@ void i2s_read_task(void *pvParameters)
 }
 
 // =================================================================
-// --- Setup y Loop (Funciones Principales) ---
+// --- Setup and Loop (Main Functions) ---
 // =================================================================
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("--- Iniciando Kode Dot PTT Client ---");
+    Serial.println("--- Starting Kode Dot PTT Client ---");
 
-    // --- Inicialización de Hardware (del template) ---
-    // Iniciar I2C para el expansor de E/S (usar pines del BSP)
+    // --- Hardware Initialization (from template) ---
+    // Initialize I2C for I/O expander (using BSP pins)
+    Serial.println("I2C: Initializing...");
     Wire.begin(IOEXP_I2C_SDA, IOEXP_I2C_SCL);
+    delay(200);
 
-    // Configurar Expansor de E/S
+    // Configure I/O Expander
+    Serial.println("I/O Expander: Initializing...");
     if (!io_expander.begin())
     {
-        Serial.println("Error: No se pudo encontrar el expansor de E/S TCA9555.");
+        Serial.println("ERROR: Could not find TCA9555 I/O expander.");
         while (1) delay(100);
     }
-    // Configurar BTN (bottom) como entrada en el expansor
     io_expander.pinMode1(EXPANDER_BUTTON_BOTTOM, INPUT);
+    Serial.println("I/O Expander configured");
+    delay(200);
 
-    // Iniciar LED
+    // Initialize LED
+    Serial.println("LED: Initializing...");
     led_setup();
-    led_set_rgb(0, 0, 20); // Azul durante el inicio
+    led_set_rgb(0, 0, 20); // Blue during startup
     led_show();
+    delay(200);
 
-    // Iniciar Display y LVGL mediante DisplayManager
+    // Initialize Display and LVGL via DisplayManager
+    Serial.println("Display: Initializing...");
     if (!displayManager.init()) {
-        Serial.println("Error: Display init failed");
+        Serial.println("ERROR: Display init failed");
         while (1) delay(100);
     }
-    create_ptt_ui(); // Crear nuestra UI personalizada
-    // --- Fin de Inicialización de Hardware ---
+    
+    // *** IMPORTANT: Create UI BEFORE using it ***
+    Serial.println("Creating UI...");
+    create_ptt_ui();
+    
+    // Now we can use lblStatus
+    lv_label_set_text(lblStatus, "INITIALIZING...");
+    displayManager.update();
+    delay(500);
+    
+    // --- SD Card Initialization (SD_MMC with custom pins) ---
+    lv_label_set_text(lblStatus, "SD: Configuring pins...");
+    displayManager.update();
+    Serial.println("SD: Configuring pins...");
+    
+    // Configure SD_MMC pins according to Kode Dot board
+    if (!SD_MMC.setPins(SD_PIN_CLK, SD_PIN_CMD, SD_PIN_D0))
+    {
+        Serial.println("ERROR: Could not configure SD_MMC pins");
+        lv_label_set_text(lblStatus, "ERROR: SD setPins");
+        displayManager.update();
+        while (1) delay(100);
+    }
+    Serial.println("SD_MMC pins configured");
+    delay(200);
+    
+    // Initialize SD_MMC with 1-bit mode
+    lv_label_set_text(lblStatus, "SD: Initializing...");
+    displayManager.update();
+    Serial.println("SD: Initializing in 1-bit mode...");
+    if (!SD_MMC.begin(SD_MOUNT_POINT, 1))  // 1 = 1-bit mode
+    {
+        Serial.println("ERROR: Could not initialize SD card");
+        lv_label_set_text(lblStatus, "ERROR: SD failed");
+        displayManager.update();
+        while (1) delay(100);
+    }
+    Serial.println("SD initialized successfully");
+    delay(200);
 
+    // --- Read configurations from SD ---
+    readOrCreatePTTConfig();
 
-    // --- Inicialización PTT ---
+    // --- Get device MAC as credentials ---
+    USERNAME = getDeviceMAC();
+    PASSWORD = USERNAME; // MAC is the password too
+    
+    Serial.printf("USERNAME (MAC): %s\n", USERNAME.c_str());
+    Serial.printf("PASSWORD (MAC): %s\n", PASSWORD.c_str());
+    Serial.printf("FRIENDLY_NAME: %s\n", FRIENDLY_NAME.c_str());
+
+    lv_label_set_text(lblStatus, "Credentials OK");
+    displayManager.update();
+    delay(500);
+    
+    // --- End of Hardware Initialization ---
+
+    // --- PTT Initialization ---
     setupI2S();
     setupWifi();
 
     if (loginAndGetDevice())
     {
         setupWebSocket();
+        lv_label_set_text(lblStatus, "Ready");
+        displayManager.update();
     }
     else
     {
-        Serial.println("Error en la autenticación. deteniendo.");
+        Serial.println("ERROR: Authentication failed");
         lv_label_set_text(lblStatus, "Auth Failed!");
+        displayManager.update();
         while (1) delay(100);
     }
     
-    led_set_rgb(0, 0, 0); // Apagar LED
+    led_set_rgb(0, 0, 0); // Turn off LED
     led_show();
 
-    // --- Iniciar Tareas (en Core 0) ---
+    // --- Start Tasks (on Core 0) ---
+    lv_label_set_text(lblStatus, "STARTING TASKS...");
+    displayManager.update();
+    delay(500);
+    
     xTaskCreatePinnedToCore(
-        ptt_button_task,   // Función de la Tarea
-        "PTTButtonTask",   // Nombre
-        2048,              // Stack size
-        NULL,              // Parámetros
-        5,                 // Prioridad
-        NULL,              // Handle
-        0                  // Core 0
+        ptt_button_task,
+        "PTTButtonTask",
+        2048,
+        NULL,
+        5,
+        NULL,
+        0
     );
 
     xTaskCreatePinnedToCore(
-        i2s_read_task,     // Función de la Tarea
-        "I2SReadTask",     // Nombre
-        4096,              // Stack size
-        NULL,              // Parámetros
-        5,                 // Prioridad
-        NULL,              // Handle
-        0                  // Core 0
+        i2s_read_task,
+        "I2SReadTask",
+        4096,
+        NULL,
+        5,
+        NULL,
+        0
     );
     
-    Serial.println("--- Configuración Completa ---");
+    Serial.println("--- Configuration Complete ---");
+    lv_label_set_text(lblStatus, "Ready");
+    displayManager.update();
 }
 
 void loop()
 {
-    // --- Tareas del Loop Principal (Core 1) ---
+    // --- Main Loop Tasks (Core 1) ---
 
-    // 1. Manejar el cliente WebSocket (muy importante)
+    // 1. Handle WebSocket client (very important)
     webSocket.loop();
 
-    // 2. Manejar LVGL mediante DisplayManager (actualiza ticks y handlers)
+    // 2. Handle LVGL via DisplayManager (updates ticks and handlers)
     displayManager.update();
     delay(5);
 
-    // 3. Manejar cambios de estado de PTT (desde el flag)
+    // 3. Handle PTT state changes (from flag)
     if (pttStateChanged)
     {
-        pttStateChanged = false; // Resetear el flag
+        pttStateChanged = false; // Reset the flag
         if (isPttActive)
         {
-            // --- PTT PRESIONADO ---
+            // --- PTT PRESSED ---
             Serial.println("PTT: START");
             if (isWebSocketConnected) {
-                // Enviar "talk_start" (como en client.py)
+                // Send "talk_start" (as in client.py)
                 webSocket.sendTXT("{\"type\":\"talk_start\"}");
             }
             lv_label_set_text(lblPttStatus, "TALKING");
-            led_set_rgb(0, 50, 0); // Verde
+            led_set_rgb(0, 50, 0); // Green
         }
         else
         {
-            // --- PTT SOLTADO ---
+            // --- PTT RELEASED ---
             Serial.println("PTT: STOP");
              if (isWebSocketConnected) {
-                // Enviar "talk_stop" (como en client.py)
+                // Send "talk_stop" (as in client.py)
                 webSocket.sendTXT("{\"type\":\"talk_stop\"}");
             }
             lv_label_set_text(lblPttStatus, "HOLD TO TALK");
-            led_set_rgb(0, 0, 0); // Apagado
+            led_set_rgb(0, 0, 0); // Off
         }
         led_show();
     }
 
-    // 4. Manejar estado de audio entrante (LED y UI)
+    // 4. Handle incoming audio state (LED and UI)
     if (isReceivingAudio)
     {
-        // Si estamos recibiendo, actualizar el estado
-        if (!isPttActive) // No mostrar "incoming" si estamos hablando
+        // If we're receiving, update the state
+        if (!isPttActive) // Don't show "incoming" if we're talking
         { 
             lv_label_set_text(lblIncomingStatus, "INCOMING");
-            led_set_rgb(60, 30, 0); // Naranja
+            led_set_rgb(60, 30, 0); // Orange
             led_show();
         }
-        isReceivingAudio = false; // Resetear (se activará en el próximo paquete)
+        isReceivingAudio = false; // Reset (will be set in next packet)
     }
     else if (millis() - lastAudioReceiveTime > AUDIO_DECAY_MS)
     {
-        // Si ha pasado tiempo desde el último paquete, limpiar
+        // If time has passed since last packet, clean up
         if (strlen(lv_label_get_text(lblIncomingStatus)) > 0)
         {
             lv_label_set_text(lblIncomingStatus, "");
             if (!isPttActive) {
-                led_set_rgb(0, 0, 0); // Apagar
+                led_set_rgb(0, 0, 0); // Turn off
                 led_show();
             }
         }
     }
 
-    // 5. Enviar Ping de Keepalive (como en client.py)
+    // 5. Send Keepalive Ping (as in client.py)
     if (isWebSocketConnected && (millis() - lastPingTime > KEEPALIVE_MS))
     {
         webSocket.sendTXT("{\"type\":\"ping\"}");
